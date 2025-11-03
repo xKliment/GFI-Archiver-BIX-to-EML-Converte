@@ -182,8 +182,8 @@ class BatchProgressTracker:
         return 0.0
 
 
-class BixConversionEngine:
-    """BIX to EML conversion engine with batch processing for large datasets"""
+class OptimizedBixConversionEngine:
+    """Optimized BIX to EML conversion engine with batch processing for large datasets"""
     
     def __init__(self, max_workers: int = 4, batch_size: int = 10000,
                  progress_callback: Optional[Callable] = None, memory_limit_gb: float = 2.0,
@@ -251,18 +251,19 @@ class BixConversionEngine:
             return ""
     
     def bix_to_eml(self, src_path: str, dst_path: str, compute_hash: bool = True) -> ConversionResult:
-        """Convert a single .bix file to .eml with streaming I/O and bit inversion.
+        """Convert a single .bix file to .eml following MAIS.BixPlugin logic.
 
-        - Reads source in chunks; avoids loading entire file into memory.
-        - Detects gzip header after inversion using the first two bytes.
-        - Streams gzip decompression when needed via a bit-inverting wrapper.
-        - Writes to a temporary file and renames atomically.
+        - Invert bits to .bin
+        - If .bin starts with gzip magic, decompress to .q
+        - Otherwise, rename .bin to .eml (inverted data)
+        - Then rename .q to .eml
         """
         start_time = time.time()
         file_size = 0
         file_hash = ""
 
-        tmp_path = f"{dst_path}.tmp.{os.getpid()}.{threading.get_ident()}"
+        bin_path = f"{dst_path}.bin"
+        q_path = f"{dst_path}.q"
         try:
             # Stat once
             file_size = os.path.getsize(src_path)
@@ -273,71 +274,82 @@ class BixConversionEngine:
             # Prepare optional hasher
             hasher = hashlib.md5() if compute_hash else None
 
-            with open(src_path, 'rb', buffering=self.chunk_size) as src:
-                # Peek first 2 bytes (non-destructive)
-                head = src.read(2)
-                if not head:
-                    raise Exception("Source file is empty")
-                inv_head = head.translate(INVERT_TABLE)
-                # Reset to start for streaming
-                src.seek(0)
-
-                # Decide path: gzip or plain inverted stream
-                if len(inv_head) >= 2 and inv_head[0] == 0x1F and inv_head[1] == 0x8B:
-                    # Stream-decompress via inverting reader
-                    inv_reader = _InvertingReader(src, hasher, limiter=self._limiter, chunk_size=self.chunk_size)
+            # Step 1: Invert to .bin
+            with open(src_path, 'rb', buffering=self.chunk_size) as src, open(bin_path, 'wb', buffering=self.chunk_size) as bin_out:
+                for chunk in iter(lambda: src.read(self.chunk_size), b""):
+                    if hasher:
+                        hasher.update(chunk)
+                    inv = chunk.translate(INVERT_TABLE)
+                    if self._limiter:
+                        self._limiter.consume(len(inv))
+                    bin_out.write(inv)
+                if self.fsync_on_write:
                     try:
-                        with gzip.GzipFile(fileobj=inv_reader, mode='rb') as gz, open(tmp_path, 'wb', buffering=self.chunk_size) as out:
+                        bin_out.flush()
+                        os.fsync(bin_out.fileno())
+                    except Exception:
+                        pass
+
+            # Step 2: Check if .bin is gzipped (more robust)
+            with open(bin_path, 'rb') as bin_file:
+                head = bin_file.read(3)
+                is_gzipped = (
+                    len(head) >= 3 and head[0] == 0x1F and head[1] == 0x8B and head[2] == 0x08
+                )
+
+            if is_gzipped:
+                # Decompress .bin to .q using fileobj to avoid path-related issues
+                try:
+                    with open(bin_path, 'rb') as bin_file, gzip.GzipFile(fileobj=bin_file, mode='rb') as gz, \
+                            open(q_path, 'wb', buffering=self.chunk_size) as q_out:
+                        bytes_written = 0
+                        read_size = 1024
+                        try:
                             while True:
-                                chunk = gz.read(self.chunk_size)
+                                chunk = gz.read(read_size)
                                 if not chunk:
                                     break
-                                if self._limiter is not None:
+                                q_out.write(chunk)
+                                bytes_written += len(chunk)
+                                if self._limiter:
                                     self._limiter.consume(len(chunk))
-                                out.write(chunk)
-                            if self.fsync_on_write:
-                                try:
-                                    out.flush()
-                                    os.fsync(out.fileno())
-                                except Exception:
-                                    pass
-                    except gzip.BadGzipFile as e:
-                        # Fallback: write inverted bytes as-is
-                        logger.warning(f"Gzip decompression failed for {src_path}: {e}, writing inverted data")
-                        src.seek(0)
-                        with open(tmp_path, 'wb', buffering=self.chunk_size) as out:
-                            for chunk in iter(lambda: src.read(self.chunk_size), b""):
-                                if hasher is not None:
-                                    hasher.update(chunk)
-                                inv = chunk.translate(INVERT_TABLE)
-                                if self._limiter is not None:
-                                    self._limiter.consume(len(inv))
-                                out.write(inv)
-                            if self.fsync_on_write:
-                                try:
-                                    out.flush()
-                                    os.fsync(out.fileno())
-                                except Exception:
-                                    pass
-                else:
-                    # Plain inverted stream copy
-                    with open(tmp_path, 'wb', buffering=self.chunk_size) as out:
-                        for chunk in iter(lambda: src.read(self.chunk_size), b""):
-                            if hasher is not None:
-                                hasher.update(chunk)
-                            inv = chunk.translate(INVERT_TABLE)
-                            if self._limiter is not None:
-                                self._limiter.consume(len(inv))
-                            out.write(inv)
+                        except OSError as stream_err:
+                            # If we've already written data, this likely indicates trailing non-gzip bytes
+                            # after a valid gzip member. Treat as successful completion.
+                            msg = str(stream_err).lower()
+                            if bytes_written == 0 or "not a gzipped file" not in msg:
+                                raise
                         if self.fsync_on_write:
                             try:
-                                out.flush()
-                                os.fsync(out.fileno())
+                                q_out.flush()
+                                os.fsync(q_out.fileno())
                             except Exception:
                                 pass
-
-            # Atomically move to final destination
-            os.replace(tmp_path, dst_path)
+                    os.unlink(bin_path)
+                    # Rename .q to .eml
+                    os.rename(q_path, dst_path)
+                except Exception as gz_err:
+                    # If the stream isn't actually valid gzip despite the header, fall back to non-gzip path
+                    # Common error message: "Not a gzipped file" or truncated streams
+                    try:
+                        if os.path.exists(q_path):
+                            os.unlink(q_path)
+                    except Exception:
+                        pass
+                    try:
+                        # Treat as not compressed – just keep inverted bytes as .eml
+                        os.rename(bin_path, dst_path)
+                    except Exception:
+                        # If rename fails (e.g., dst exists), replace
+                        try:
+                            if os.path.exists(dst_path):
+                                os.unlink(dst_path)
+                            os.rename(bin_path, dst_path)
+                        except Exception:
+                            raise gz_err
+            else:
+                # Rename .bin to .eml
+                os.rename(bin_path, dst_path)
 
             if hasher is not None:
                 file_hash = hasher.hexdigest()
@@ -353,12 +365,13 @@ class BixConversionEngine:
             )
 
         except Exception as e:
-            # Clean up temp file on failure
-            try:
-                if os.path.exists(tmp_path):
-                    os.unlink(tmp_path)
-            except Exception:
-                pass
+            # Clean up temp files on failure
+            for path in [bin_path, q_path]:
+                try:
+                    if os.path.exists(path):
+                        os.unlink(path)
+                except Exception:
+                    pass
 
             conversion_time = time.time() - start_time
             error_msg = f"Conversion failed: {str(e)}"
@@ -461,6 +474,53 @@ class BixConversionEngine:
             compute_hash = True
             if self.duplication_strategy == "output_exists":
                 if os.path.exists(eml_path):
+                    # Validate existing output: if it is still gzip, repair in place
+                    try:
+                        with open(eml_path, 'rb') as existing:
+                            head = existing.read(3)
+                            is_gz_out = len(head) >= 3 and head[0] == 0x1F and head[1] == 0x8B and head[2] == 0x08
+                    except Exception:
+                        is_gz_out = False
+
+                    if is_gz_out:
+                        tmp_path = eml_path + ".tmp"
+                        try:
+                            with open(eml_path, 'rb') as existing, gzip.GzipFile(fileobj=existing, mode='rb') as gz, \
+                                    open(tmp_path, 'wb', buffering=self.chunk_size) as out_f:
+                                bytes_written = 0
+                                read_size = 1024
+                                try:
+                                    while True:
+                                        chunk = gz.read(read_size)
+                                        if not chunk:
+                                            break
+                                        out_f.write(chunk)
+                                        bytes_written += len(chunk)
+                                        if self._limiter:
+                                            self._limiter.consume(len(chunk))
+                                except OSError as stream_err:
+                                    # Tolerate trailing junk after gzip member if we already produced data
+                                    if bytes_written == 0 or "not a gzipped file" not in str(stream_err).lower():
+                                        raise
+                                if self.fsync_on_write:
+                                    try:
+                                        out_f.flush()
+                                        os.fsync(out_f.fileno())
+                                    except Exception:
+                                        pass
+                            os.replace(tmp_path, eml_path)
+                            logger.info(f"Repaired gzipped output: {eml_path}")
+                            # Count as processed
+                            self.progress_tracker.update_progress(True)
+                            continue
+                        except Exception:
+                            # If repair fails, fall through to skipping existing file
+                            try:
+                                if os.path.exists(tmp_path):
+                                    os.unlink(tmp_path)
+                            except Exception:
+                                pass
+                    # Default: skip existing output
                     skip = True
                     compute_hash = False
             elif self.duplication_strategy == "ledger_hash" and self.db is not None:
