@@ -10,12 +10,7 @@ from datetime import datetime
 import logging
 from pathlib import Path
 
-# Import engine classes; alias to match current GUI usage
-from bix_conversion_engine_gui import (
-    BixConversionEngine as OptimizedBixConversionEngine,
-    ConversionResult,
-    ConversionDatabase,
-)
+from bix_conversion_engine_gui import OptimizedBixConversionEngine, ConversionResult, ConversionDatabase
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
